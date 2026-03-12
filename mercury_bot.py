@@ -35,7 +35,6 @@ OWNER_ID           = int(os.environ["OWNER_ID"])
 CHECK_INTERVAL   = 30
 PAGES_TO_SCAN    = 5
 ARCHIVE_URL      = "https://pasteview.com/paste-archive"
-PASTEDPW_URL     = "https://pasted.pw/recent.php"
 SEEN_FILE        = "seen_urls.json"
 EMPTY_SCAN_ALERT = 10
 KEYWORDS         = ["hotmail", "hits", "mixed"]
@@ -204,108 +203,6 @@ async def extract_raw(page, url: str) -> str:
 
     return ""
 
-# ─── HOST LINK EXTRACTOR ─────────────────────────────────────────────────────
-GOFILE_RE    = re.compile(r'https?://gofile\.io/d/([a-zA-Z0-9]+)')
-MEDIAFIRE_RE = re.compile(r'https?://(?:www\.)?mediafire\.com/file/([a-zA-Z0-9]+)')
-
-async def fetch_gofile(code: str) -> str:
-    """Fetch combos from a gofile link using the API."""
-    try:
-        async with aiohttp.ClientSession() as sess:
-            # Get guest token
-            async with sess.get("https://api.gofile.io/accounts") as r:
-                data = await r.json()
-                token = data.get("data", {}).get("token")
-            if not token:
-                return ""
-            # Get folder contents
-            async with sess.get(f"https://api.gofile.io/contents/{code}?wt=4fd6sg89d7s6&cache=true",
-                                 headers={"Authorization": f"Bearer {token}"}) as r:
-                data = await r.json()
-            if data.get("status") != "ok":
-                return ""
-            files = data.get("data", {}).get("children", {})
-            all_text = []
-            for f in files.values():
-                if f.get("type") == "file" and f.get("name", "").endswith(".txt"):
-                    dl_url = f.get("link", "")
-                    if dl_url:
-                        async with sess.get(dl_url, headers={"Authorization": f"Bearer {token}"}) as r:
-                            all_text.append(await r.text(errors="ignore"))
-            return "\n".join(all_text)
-    except Exception as e:
-        log.error(f"Gofile fetch error: {e}")
-        return ""
-
-async def fetch_mediafire(file_id: str, page) -> str:
-    """Fetch combos from a mediafire link using Playwright."""
-    try:
-        await page.goto(f"https://www.mediafire.com/file/{file_id}", wait_until="networkidle", timeout=15000)
-        # Find direct download link
-        dl_link = await page.evaluate("""
-            () => {
-                const a = document.querySelector('a#downloadButton') || document.querySelector('a.input.btn.green');
-                return a ? a.href : null;
-            }
-        """)
-        if not dl_link:
-            return ""
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(dl_link) as r:
-                return await r.text(errors="ignore")
-    except Exception as e:
-        log.error(f"Mediafire fetch error: {e}")
-        return ""
-
-async def extract_from_hosts(raw: str, page) -> str:
-    """Check raw text for gofile/mediafire links and fetch their contents."""
-    extra = []
-    for match in GOFILE_RE.finditer(raw):
-        log.info(f"Found gofile link: {match.group(0)}")
-        text = await fetch_gofile(match.group(1))
-        if text:
-            extra.append(text)
-    for match in MEDIAFIRE_RE.finditer(raw):
-        log.info(f"Found mediafire link: {match.group(0)}")
-        text = await fetch_mediafire(match.group(1), page)
-        if text:
-            extra.append(text)
-    return "\n".join(extra)
-
-async def scrape_pastedpw(page, pages: int = 5) -> list[dict]:
-    """Scrape pasted.pw for keyword-matching pastes."""
-    found = []
-    for page_num in range(1, pages + 1):
-        url = PASTEDPW_URL if page_num == 1 else f"{PASTEDPW_URL}?page={page_num}"
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2000)
-            matches = await page.evaluate("""
-                (keywords) => {
-                    const results = [];
-                    for (const a of document.querySelectorAll('a')) {
-                        const text = (a.innerText || a.textContent || '').toLowerCase();
-                        if (keywords.some(k => text.includes(k))) {
-                            const href = a.href;
-                            if (href && href.includes('pasted.pw') && !href.includes('recent')) {
-                                results.push({
-                                    title: (a.innerText || a.textContent || '').trim().replace(/\s+/g, ' '),
-                                    url: href,
-                                    source: 'pasted.pw'
-                                });
-                            }
-                        }
-                    }
-                    return results;
-                }
-            """, KEYWORDS)
-            log.info(f"pasted.pw page {page_num}: {len(matches)} match(es)")
-            found.extend(matches)
-        except Exception as e:
-            log.error(f"pasted.pw page {page_num} failed: {e}")
-    return found
-
-
 # ─── BACKGROUND TASK ─────────────────────────────────────────────────────────
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def monitor_loop():
@@ -392,14 +289,6 @@ async def monitor_loop():
                     log.info(f"Page {page_num}: {len(matches)} match(es)")
                     found.extend(matches)
 
-                # ── Also scrape pasted.pw ─────────────────────────────
-                try:
-                    pw_found = await scrape_pastedpw(page, PAGES_TO_SCAN)
-                    found.extend(pw_found)
-                    log.info(f"pasted.pw total: {len(pw_found)} match(es)")
-                except Exception as e:
-                    log.error(f"pasted.pw scrape failed: {e}")
-
                 # Deduplicate and filter blacklisted titles
                 seen_this_run = set()
                 pastes        = []
@@ -453,11 +342,6 @@ async def monitor_loop():
                         url = item["url"]
                         log.info(f"Extracting from {url}")
                         raw = await extract_raw(page, url)
-                        # Also check for gofile/mediafire links inside the paste
-                        if raw:
-                            host_content = await extract_from_hosts(raw, page)
-                            if host_content:
-                                raw = raw + "\n" + host_content
                         if raw:
                             creds = extract_credentials(raw)
                             if creds:
@@ -679,4 +563,5 @@ async def on_resumed():
 
 # ─── RUN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+
     bot.run(DISCORD_TOKEN, log_handler=None)
