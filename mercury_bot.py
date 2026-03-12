@@ -278,8 +278,8 @@ async def scrape_pastedpw(page, pages: int = 5) -> list[dict]:
     for page_num in range(1, pages + 1):
         url = PASTEDPW_URL if page_num == 1 else f"{PASTEDPW_URL}?page={page_num}"
         try:
-            await page.goto(url, wait_until="networkidle", timeout=20000)
-            await page.wait_for_timeout(1500)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
             matches = await page.evaluate("""
                 (keywords) => {
                     const results = [];
