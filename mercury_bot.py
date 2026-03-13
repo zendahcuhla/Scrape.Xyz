@@ -23,9 +23,6 @@ from playwright.async_api import async_playwright
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 DISCORD_TOKEN      = os.environ["DISCORD_TOKEN"]
-CHANNEL_ID         = int(os.environ["CHANNEL_ID"])
-NEW_CHANNEL_ID     = int(os.environ["NEW_CHANNEL_ID"])
-CONTENT_CHANNEL_ID = int(os.environ["CONTENT_CHANNEL_ID"])
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT        = os.environ["TELEGRAM_CHAT"]
 TELEGRAM_PUBLIC_CHAT  = os.environ["TELEGRAM_PUBLIC_CHAT"]
@@ -60,9 +57,6 @@ recent_filenames   = []  # tracks last 10 posted filenames for public update
 # ─── FEATURE TOGGLES ─────────────────────────────────────────────────────────
 toggles = {
     "scanning":        True,   # master on/off for scanning
-    "discord_urls":    True,   # post URL list to channel 1
-    "discord_alerts":  True,   # post new URL alerts to channel 2
-    "discord_content": True,   # post combo file to channel 3
     "telegram":        True,   # post to private telegram
     "telegram_public": True,   # post update message to public telegram
     "owner_dm":        True,   # DM owner on new file
@@ -146,24 +140,6 @@ async def send_telegram_file(text, filename: str):
 intents = discord.Intents.default()
 bot  = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
-
-async def post_pastes(channel, pastes: list[dict]):
-    if not pastes:
-        return
-    try:
-        content  = "\n".join(item["url"] for item in pastes)
-        filename = f"hotmail_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
-        await channel.send(file=discord.File(fp=io.BytesIO(content.encode()), filename=filename))
-    except Exception as e:
-        log.error(f"Failed to post file: {e}")
-
-async def post_new_alerts(channel, pastes: list[dict]):
-    for item in pastes:
-        try:
-            await channel.send(f"= DETECTED 1 NEW URL =\n{item['url']}")
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            log.error(f"Failed to post alert: {e}")
 
 async def extract_raw(page, url: str) -> str:
     for attempt in range(2):
@@ -262,12 +238,6 @@ async def extract_pastedpw(page, url: str) -> str:
 # ─── BACKGROUND TASK ─────────────────────────────────────────────────────────
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def monitor_loop():
-    try:
-        channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
-    except Exception as e:
-        log.error(f"Could not get channel: {e}")
-        return
-
     if not toggles["scanning"]:
         return
 
@@ -366,9 +336,6 @@ async def monitor_loop():
 
                 stats["total_pastes"] += len(pastes)
 
-                # ── Step 3: post all URLs to channel 1 ────────────────────
-                await post_pastes(channel, pastes)
-
                 # ── Step 4: filter new pastes & mark seen ─────────────────
                 new_pastes = [p for p in pastes if p["url"] not in posted_urls]
                 if not new_pastes:
@@ -388,17 +355,8 @@ async def monitor_loop():
                 save_seen(posted_urls)
                 log.info(f"{len(new_pastes)} new paste(s) detected")
 
-                # ── Step 5: new URL alerts to channel 2 ───────────────────
-                if toggles["discord_alerts"]:
-                    try:
-                        new_channel = bot.get_channel(NEW_CHANNEL_ID) or await bot.fetch_channel(NEW_CHANNEL_ID)
-                        await post_new_alerts(new_channel, new_pastes)
-                    except Exception as e:
-                        log.error(f"Could not post to new channel: {e}")
-
                 # ── Step 6: extract creds & post to channel 3 ─────────────
                 try:
-                    content_channel = bot.get_channel(CONTENT_CHANNEL_ID) or await bot.fetch_channel(CONTENT_CHANNEL_ID)
                     combined        = []
 
                     for item in new_pastes[:5]:
@@ -447,20 +405,6 @@ async def monitor_loop():
                         log.info(f"Split {len(all_raw)} combos into {len(chunks)} file(s)")
 
                     if combined:
-                        # Post all chunks at once to Discord
-                        if toggles["discord_content"]:
-                            files = []
-                            for i, chunk in enumerate(chunks):
-                                fname = f"{len(chunk)} {label.upper()}.txt"
-                                files.append(discord.File(fp=io.BytesIO("\n".join(chunk).encode()), filename=fname))
-                            try:
-                                # Discord allows max 10 files per message
-                                for i in range(0, len(files), 10):
-                                    await content_channel.send(files=files[i:i+10])
-                                log.info(f"Posted {len(files)} file(s) to Discord")
-                            except Exception as e:
-                                log.error(f"Failed to post files to Discord: {e}")
-
                         # DM owner
                         if toggles["owner_dm"]:
                             try:
@@ -566,9 +510,6 @@ async def cmd_scrape(interaction: discord.Interaction, pages: int = PAGES_TO_SCA
 @app_commands.describe(feature="Feature to toggle")
 @app_commands.choices(feature=[
     app_commands.Choice(name="scanning",        value="scanning"),
-    app_commands.Choice(name="discord_urls",    value="discord_urls"),
-    app_commands.Choice(name="discord_alerts",  value="discord_alerts"),
-    app_commands.Choice(name="discord_content", value="discord_content"),
     app_commands.Choice(name="telegram",        value="telegram"),
     app_commands.Choice(name="telegram_public", value="telegram_public"),
     app_commands.Choice(name="owner_dm",        value="owner_dm"),
