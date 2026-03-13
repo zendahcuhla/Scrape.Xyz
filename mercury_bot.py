@@ -398,7 +398,7 @@ async def monitor_loop():
                         chunks = []
                         remaining = all_raw[:]
                         while remaining:
-                            size = random.randint(1, min(1000, len(remaining)))
+                            size = random.randint(100, min(1000, len(remaining)))
                             chunks.append(remaining[:size])
                             remaining = remaining[size:]
 
