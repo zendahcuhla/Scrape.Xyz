@@ -21,6 +21,7 @@ RUN playwright install chromium
 
 COPY mercury_bot.py .
 COPY promo.png .
+COPY mailhub.py .
 
 
 CMD ["python", "mercury_bot.py"]
