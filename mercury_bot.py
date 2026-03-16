@@ -475,15 +475,8 @@ async def monitor_loop():
                         else:
                             quality = "HQ"
 
-                        # Split into random chunks of 100-1500 lines
-                        chunks = []
-                        remaining = all_raw[:]
-                        while remaining:
-                            size = random.randint(min(100, len(remaining)), min(1500, len(remaining)))
-                            chunks.append(remaining[:size])
-                            remaining = remaining[size:]
-
-                        log.info(f"Split {len(all_raw)} combos into {len(chunks)} file(s) [{quality}]")
+                        chunks = [all_raw]
+                        log.info(f"{len(all_raw)} combos in 1 file [{quality}]")
 
                     if combined:
                         # DM owner
