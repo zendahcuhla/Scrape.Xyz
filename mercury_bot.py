@@ -518,7 +518,7 @@ async def monitor_loop():
                                                 domain_map.setdefault(domain, []).append(combo)
                                         except Exception:
                                             pass
-                                    if domain_map:
+                                    domain_map = {d: c for d, c in domain_map.items() if len(c) >= 50}
                                         num_domains = random.randint(1, min(3, len(domain_map)))
                                         picked = random.sample(list(domain_map.keys()), num_domains)
                                         for domain in picked:
